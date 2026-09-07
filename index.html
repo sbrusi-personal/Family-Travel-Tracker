@@ -18,7 +18,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/topojson-client/3.1.0/topojson-client.min.js"></script>
+  <script src="https://unpkg.com/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
   <script type="text/babel">
 
 const BACKEND = "YOUR_APPS_SCRIPT_URL_HERE";
@@ -159,9 +159,8 @@ function MemberChips({ members, filter, setFilter }) {
 
 // ── Map view (US or World) ──
 function MapView({ type, features, loading, members, visits, filter, onRegionClick }) {
-  // Normalize codes because Google Sheets may convert numeric-looking
-  // state/country codes from strings into numbers when data is reloaded.
-  // US FIPS codes need two digits (e.g. "06" for California).
+  // Google Sheets may return numeric-looking codes as numbers after reload.
+  // Normalize them before comparing so saved visits still match map regions.
   function normalizeCode(value, regionType) {
     const s = String(value ?? '').trim();
     return regionType === 'us' ? s.padStart(2, '0') : s;
@@ -192,6 +191,19 @@ function MapView({ type, features, loading, members, visits, filter, onRegionCli
 
   if (loading) {
     return <div style={{padding:40, textAlign:'center', color:'#64748b', fontSize:14}}>Loading map…</div>;
+  }
+
+  if (!features || features.length === 0) {
+    return (
+      <div style={{margin:'8px 12px 16px', padding:20, border:'1px solid #7f1d1d',
+        borderRadius:10, background:'#1c0b0b', color:'#fecaca', fontSize:13}}>
+        <div style={{fontWeight:700, marginBottom:6}}>Map could not be loaded</div>
+        <div>{window.__MAP_LOAD_ERROR__ || 'No map geometry was returned.'}</div>
+        <div style={{marginTop:8, color:'#fca5a5'}}>
+          Open your browser Developer Console (F12) for the detailed error.
+        </div>
+      </div>
+    );
   }
 
   const viewBox = type === 'us' ? '0 0 960 600' : '0 0 960 500';
@@ -430,29 +442,132 @@ function App() {
 
   // ── Load map geometry once ──
   React.useEffect(() => {
-    Promise.all([
-      fetch(US_TOPO_URL).then(r => r.json()),
-      fetch(WORLD_TOPO_URL).then(r => r.json())
-    ]).then(([usTopo, worldTopo]) => {
-      const usGeo = topojson.feature(usTopo, usTopo.objects.states);
-      const usPath = d3.geoPath();
-      setUsFeatures(usGeo.features.map(f => ({
-        code: String(f.id), name: f.properties.name,
-        d: usPath(f), centroid: usPath.centroid(f)
-      })));
+    let cancelled = false;
 
-      const worldGeo = topojson.feature(worldTopo, worldTopo.objects.countries);
-      const projection = d3.geoNaturalEarth1().fitSize([960, 500], worldGeo);
-      const worldPath = d3.geoPath().projection(projection);
-      setWorldFeatures(worldGeo.features
-        .filter(f => f.properties && f.properties.name && f.properties.name !== 'Antarctica')
-        .map(f => ({
-          code: String(f.id), name: f.properties.name,
-          d: worldPath(f), centroid: worldPath.centroid(f)
-        })));
+    async function ensureTopojson() {
+      if (window.topojson && typeof window.topojson.feature === 'function') return true;
 
-      setMapsLoading(false);
-    }).catch(() => setMapsLoading(false));
+      // Some browsers / network configurations fail to expose the cdnjs
+      // UMD build as the global `topojson`. Try an independent CDN before
+      // giving up. This is intentionally done at runtime so the app can
+      // recover without requiring a build step.
+      const fallbackUrls = [
+        'https://unpkg.com/topojson-client@3.1.0/dist/topojson-client.min.js',
+        'https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js'
+      ];
+
+      for (const src of fallbackUrls) {
+        try {
+          await new Promise((resolve, reject) => {
+            const existing = document.querySelector(`script[data-topojson-fallback="${src}"]`);
+            if (existing) {
+              existing.addEventListener('load', resolve, { once:true });
+              existing.addEventListener('error', reject, { once:true });
+              return;
+            }
+            const s = document.createElement('script');
+            s.src = src;
+            s.async = false;
+            s.dataset.topojsonFallback = src;
+            s.onload = resolve;
+            s.onerror = reject;
+            document.head.appendChild(s);
+          });
+          if (window.topojson && typeof window.topojson.feature === 'function') return true;
+        } catch (e) {
+          console.warn('TopoJSON fallback failed:', src, e);
+        }
+      }
+      return false;
+    }
+
+    async function loadMaps() {
+      try {
+        const topojsonReady = await ensureTopojson();
+        if (!topojsonReady) {
+          throw new Error('TopoJSON library could not be loaded. The map conversion library is unavailable.');
+        }
+
+        const [usResponse, worldResponse] = await Promise.all([
+          fetch(US_TOPO_URL, { cache: 'force-cache' }),
+          fetch(WORLD_TOPO_URL, { cache: 'force-cache' })
+        ]);
+
+        if (!usResponse.ok) throw new Error(`US map HTTP ${usResponse.status}`);
+        if (!worldResponse.ok) throw new Error(`World map HTTP ${worldResponse.status}`);
+
+        const [usTopo, worldTopo] = await Promise.all([
+          usResponse.json(),
+          worldResponse.json()
+        ]);
+
+        if (cancelled) return;
+
+        if (!usTopo?.objects?.states) {
+          throw new Error('US TopoJSON does not contain an objects.states layer.');
+        }
+        if (!worldTopo?.objects?.countries) {
+          throw new Error('World TopoJSON does not contain an objects.countries layer.');
+        }
+
+        // US states.  Keep the TopoJSON numeric FIPS id as the stored code
+        // because existing saved visits may already use those IDs.
+        const usGeo = topojson.feature(usTopo, usTopo.objects.states);
+        const usPath = d3.geoPath();
+
+        const usFeatures = usGeo.features
+          .filter(f => f && f.geometry)
+          .map(f => ({
+            code: String(f.id),
+            name: f.properties?.name || `State ${f.id}`,
+            d: usPath(f),
+            centroid: usPath.centroid(f)
+          }))
+          .filter(f => f.d);
+
+        // World countries.  Fit the projection only to the actual displayed
+        // geometry, excluding Antarctica.
+        const worldGeo = topojson.feature(worldTopo, worldTopo.objects.countries);
+        const worldFeaturesGeo = worldGeo.features.filter(
+          f => f && f.geometry &&
+               f.properties?.name &&
+               f.properties.name !== 'Antarctica'
+        );
+
+        const projection = d3.geoNaturalEarth1()
+          .fitSize([960, 500], {
+            type: 'FeatureCollection',
+            features: worldFeaturesGeo
+          });
+
+        const worldPath = d3.geoPath().projection(projection);
+
+        const worldFeatures = worldFeaturesGeo
+          .map(f => ({
+            code: String(f.id),
+            name: f.properties.name,
+            d: worldPath(f),
+            centroid: worldPath.centroid(f)
+          }))
+          .filter(f => f.d);
+
+        if (!usFeatures.length) throw new Error('US map loaded but contained no drawable states.');
+        if (!worldFeatures.length) throw new Error('World map loaded but contained no drawable countries.');
+
+        setUsFeatures(usFeatures);
+        setWorldFeatures(worldFeatures);
+        setMapsLoading(false);
+      } catch (err) {
+        console.error('Family Travel Tracker map loading failed:', err);
+        if (!cancelled) {
+          setMapsLoading(false);
+          window.__MAP_LOAD_ERROR__ = err?.message || String(err);
+        }
+      }
+    }
+
+    loadMaps();
+    return () => { cancelled = true; };
   }, []);
 
   // ── Boot ──
@@ -580,6 +695,9 @@ function App() {
             filter={filter}
             onRegionClick={(f) => setSelectedRegion({ type: tab, code: f.code, name: f.name })}
           />
+          <div style={{padding:'0 16px', marginBottom:6, fontSize:11, color:'#475569'}}>
+            {tab === 'us' ? `${usFeatures.length} states loaded` : `${worldFeatures.length} countries loaded`}
+          </div>
           <div style={{padding:'0 16px', display:'flex', gap:14, fontSize:12, color:'#64748b', flexWrap:'wrap'}}>
             <span><span style={{display:'inline-block', width:10, height:10, background:UNVISITED_FILL, border:'1px solid #1e293b', marginRight:5, verticalAlign:'middle'}}></span>Not visited</span>
             <span><span style={{display:'inline-block', width:10, height:10, background:PARTIAL_FILL, marginRight:5, verticalAlign:'middle'}}></span>Some visited</span>
