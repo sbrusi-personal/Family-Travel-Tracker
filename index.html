@@ -18,7 +18,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/topojson-client/3.1.0/topojson-client.min.js"></script>
+  <script src="https://unpkg.com/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
   <script type="text/babel">
 
 const BACKEND = "YOUR_APPS_SCRIPT_URL_HERE";
@@ -434,8 +434,50 @@ function App() {
   React.useEffect(() => {
     let cancelled = false;
 
+    async function ensureTopojson() {
+      if (window.topojson && typeof window.topojson.feature === 'function') return true;
+
+      // Some browsers / network configurations fail to expose the cdnjs
+      // UMD build as the global `topojson`. Try an independent CDN before
+      // giving up. This is intentionally done at runtime so the app can
+      // recover without requiring a build step.
+      const fallbackUrls = [
+        'https://unpkg.com/topojson-client@3.1.0/dist/topojson-client.min.js',
+        'https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js'
+      ];
+
+      for (const src of fallbackUrls) {
+        try {
+          await new Promise((resolve, reject) => {
+            const existing = document.querySelector(`script[data-topojson-fallback="${src}"]`);
+            if (existing) {
+              existing.addEventListener('load', resolve, { once:true });
+              existing.addEventListener('error', reject, { once:true });
+              return;
+            }
+            const s = document.createElement('script');
+            s.src = src;
+            s.async = false;
+            s.dataset.topojsonFallback = src;
+            s.onload = resolve;
+            s.onerror = reject;
+            document.head.appendChild(s);
+          });
+          if (window.topojson && typeof window.topojson.feature === 'function') return true;
+        } catch (e) {
+          console.warn('TopoJSON fallback failed:', src, e);
+        }
+      }
+      return false;
+    }
+
     async function loadMaps() {
       try {
+        const topojsonReady = await ensureTopojson();
+        if (!topojsonReady) {
+          throw new Error('TopoJSON library could not be loaded. The map conversion library is unavailable.');
+        }
+
         const [usResponse, worldResponse] = await Promise.all([
           fetch(US_TOPO_URL, { cache: 'force-cache' }),
           fetch(WORLD_TOPO_URL, { cache: 'force-cache' })
