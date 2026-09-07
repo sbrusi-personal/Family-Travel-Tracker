@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <title>Family Travel Tracker</title>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { margin: 0; background: #05080f; }
+    button, input { font-family: Georgia, serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/topojson-client/3.1.0/topojson-client.min.js"></script>
+  <script type="text/babel">
+
+const BACKEND = "YOUR_APPS_SCRIPT_URL_HERE";
+const STORAGE_KEY = "family-travel-tracker-v1";
+
+const US_TOPO_URL = "https://cdn.jsdelivr.net/npm/us-atlas@3/states-albers-10m.json";
+const WORLD_TOPO_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
+
+const MEMBER_COLORS = ['#3b82f6','#ef4444','#22c55e','#f97316','#a855f7','#eab308','#ec4899','#14b8a6'];
+const UNVISITED_FILL = '#0f172a';
+const PARTIAL_FILL = '#1e3a5f';
+const ALL_VISITED_FILL = '#78350f';
+const ALL_VISITED_STROKE = '#f59e0b';
+
+function uid() { return Date.now() + '-' + Math.random().toString(36).slice(2, 7); }
+
+// ── JSONP API — NEVER use fetch() for this (CORS will block it) ──
+function getBackendUrl() {
+  const stored = loadLocal().backendUrl;
+  return (stored && stored.includes('script.google.com')) ? stored : BACKEND;
+}
+function api(params) {
+  const url = getBackendUrl();
+  if (!url || !url.includes('script.google.com')) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const cb = 'cb_' + Math.random().toString(36).slice(2);
+    const qs = Object.entries({...params, callback: cb})
+      .map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+    const s = document.createElement('script');
+    const t = setTimeout(() => { delete window[cb]; s.remove(); resolve(null); }, 12000);
+    window[cb] = (d) => { clearTimeout(t); delete window[cb]; s.remove(); resolve(d); };
+    s.onerror = () => { clearTimeout(t); delete window[cb]; s.remove(); resolve(null); };
+    s.src = `${url}?${qs}`;
+    document.head.appendChild(s);
+  });
+}
+
+function loadLocal() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch(e) { return {}; }
+}
+function saveLocal(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e) {}
+}
+
+function defaultMembers() {
+  const names = ['Sebas', 'Wife', 'Kid (9)', 'Kid (6)'];
+  return names.map((name, i) => ({ id: uid(), name, color: MEMBER_COLORS[i % MEMBER_COLORS.length] }));
+}
+
+// ── Onboarding ──
+function OnboardingScreen({ onComplete }) {
+  const [mode, setMode] = React.useState('choice');
+  const [url, setUrl] = React.useState('');
+  const [status, setStatus] = React.useState('');
+
+  async function handleRestore() {
+    if (!url.includes('script.google.com')) { setStatus('Paste the full /exec URL'); return; }
+    setStatus('Connecting...');
+    saveLocal({ backendUrl: url });
+    const res = await api({ action: 'get_all' });
+    if (!res?.ok) { setStatus('Could not reach that URL. Check deployment settings.'); return; }
+    onComplete(url, res);
+  }
+
+  return (
+    <div style={{minHeight:'100vh', background:'#05080f', color:'#cbd5e1',
+      fontFamily:'Georgia,serif', display:'flex', alignItems:'center', justifyContent:'center', padding:24}}>
+      {mode === 'choice' ? (
+        <div style={{textAlign:'center', maxWidth:340}}>
+          <div style={{fontSize:28, marginBottom:8}}>🗺️</div>
+          <div style={{fontSize:20, fontWeight:700, color:'#f1f5f9', marginBottom:8}}>Family Travel Tracker</div>
+          <div style={{color:'#94a3b8', marginBottom:32, fontSize:14}}>Is this a new setup or are you joining an existing one?</div>
+          <button onClick={() => onComplete(BACKEND, null)}
+            style={{display:'block', width:'100%', padding:'14px', background:'#1e3a5f',
+              border:'1px solid #3b82f6', borderRadius:10, color:'#93c5fd', fontSize:15,
+              cursor:'pointer', marginBottom:12}}>
+            Start fresh (new data)
+          </button>
+          <button onClick={() => setMode('restore')}
+            style={{display:'block', width:'100%', padding:'14px', background:'#1c2a1c',
+              border:'1px solid #166534', borderRadius:10, color:'#4ade80', fontSize:15, cursor:'pointer'}}>
+            Join existing (restore from cloud)
+          </button>
+        </div>
+      ) : (
+        <div style={{maxWidth:360, width:'100%'}}>
+          <div style={{fontSize:16, fontWeight:700, color:'#f1f5f9', marginBottom:8}}>Paste your Apps Script URL</div>
+          <div style={{color:'#64748b', fontSize:13, marginBottom:12}}>
+            Find it in the Family tab on the device that already has data.
+          </div>
+          <input value={url} onChange={e => setUrl(e.target.value)}
+            placeholder="https://script.google.com/macros/s/.../exec"
+            style={{width:'100%', padding:'10px 12px', background:'#0f172a', border:'1px solid #1e3a5f',
+              borderRadius:8, color:'#f1f5f9', fontSize:13, marginBottom:12}} />
+          {status && <div style={{color: status.startsWith('Could') ? '#ef4444' : '#94a3b8',
+            fontSize:13, marginBottom:8}}>{status}</div>}
+          <button onClick={handleRestore}
+            style={{width:'100%', padding:'12px', background:'#1e3a5f', border:'1px solid #3b82f6',
+              borderRadius:8, color:'#93c5fd', fontSize:15, cursor:'pointer', marginBottom:8}}>
+            Connect & Restore
+          </button>
+          <button onClick={() => setMode('choice')}
+            style={{width:'100%', padding:'10px', background:'none', border:'1px solid #1e293b',
+              borderRadius:8, color:'#475569', fontSize:14, cursor:'pointer'}}>
+            Back
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Member filter chips ──
+function MemberChips({ members, filter, setFilter }) {
+  return (
+    <div style={{display:'flex', gap:8, flexWrap:'wrap', padding:'12px 16px 4px'}}>
+      <button onClick={() => setFilter('all')}
+        style={{padding:'6px 14px', borderRadius:20, fontSize:13, cursor:'pointer',
+          background: filter==='all' ? '#1e3a5f' : 'none',
+          border: filter==='all' ? '1px solid #3b82f6' : '1px solid #1e293b',
+          color: filter==='all' ? '#93c5fd' : '#94a3b8'}}>
+        All
+      </button>
+      {members.map(m => (
+        <button key={m.id} onClick={() => setFilter(m.id)}
+          style={{padding:'6px 14px', borderRadius:20, fontSize:13, cursor:'pointer',
+            display:'flex', alignItems:'center', gap:6,
+            background: filter===m.id ? m.color+'33' : 'none',
+            border: filter===m.id ? `1px solid ${m.color}` : '1px solid #1e293b',
+            color: filter===m.id ? '#f1f5f9' : '#94a3b8'}}>
+          <span style={{width:9, height:9, borderRadius:'50%', background:m.color, display:'inline-block'}}></span>
+          {m.name}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Map view (US or World) ──
+function MapView({ type, features, loading, members, visits, filter, onRegionClick }) {
+  function visitorsFor(code) {
+    return visits.filter(v => v.type === type && v.code === code);
+  }
+  function fillFor(code) {
+    const vis = visitorsFor(code);
+    if (filter !== 'all') {
+      const has = vis.some(v => v.member_id === filter);
+      const m = members.find(x => x.id === filter);
+      return has && m ? m.color : UNVISITED_FILL;
+    }
+    if (vis.length === 0) return UNVISITED_FILL;
+    if (members.length > 0 && vis.length >= members.length) return ALL_VISITED_FILL;
+    return PARTIAL_FILL;
+  }
+  function strokeFor(code) {
+    const vis = visitorsFor(code);
+    if (filter === 'all' && members.length > 0 && vis.length >= members.length && vis.length > 0) return ALL_VISITED_STROKE;
+    return '#1e293b';
+  }
+
+  if (loading) {
+    return <div style={{padding:40, textAlign:'center', color:'#64748b', fontSize:14}}>Loading map…</div>;
+  }
+
+  const viewBox = type === 'us' ? '0 0 960 600' : '0 0 960 500';
+
+  return (
+    <div style={{padding:'8px 12px 16px'}}>
+      <svg viewBox={viewBox} style={{width:'100%', height:'auto', display:'block'}}>
+        {features.map(f => (
+          <path key={f.code} d={f.d} fill={fillFor(f.code)} stroke={strokeFor(f.code)} strokeWidth={1}
+            onClick={() => onRegionClick(f)} style={{cursor:'pointer'}} />
+        ))}
+        {filter === 'all' && features.map(f => {
+          const vis = visitorsFor(f.code);
+          if (vis.length === 0 || !f.centroid) return null;
+          const r = 3;
+          const gap = 8;
+          const startX = f.centroid[0] - ((vis.length - 1) * gap) / 2;
+          return (
+            <g key={f.code + '-dots'}>
+              {vis.map((v, i) => {
+                const m = members.find(x => x.id === v.member_id);
+                if (!m) return null;
+                return <circle key={v.id} cx={startX + i * gap} cy={f.centroid[1]} r={r}
+                  fill={m.color} stroke="#05080f" strokeWidth={0.75} />;
+              })}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// ── Region detail modal ──
+function RegionModal({ region, members, visits, onToggle, onClose }) {
+  if (!region) return null;
+  const visitorIds = visits.filter(v => v.type === region.type && v.code === region.code).map(v => v.member_id);
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{position:'fixed', inset:0, background:'rgba(0,0,0,0.88)',
+        display:'flex', alignItems:'center', justifyContent:'center', zIndex:400, padding:16}}>
+      <div style={{background:'#0d1827', border:'1px solid #1e3a5f',
+        borderRadius:16, padding:24, width:'100%', maxWidth:380}}>
+        <div style={{fontSize:18, fontWeight:700, color:'#f1f5f9', marginBottom:4}}>{region.name}</div>
+        <div style={{fontSize:12, color:'#64748b', marginBottom:16}}>
+          {region.type === 'us' ? 'U.S. State' : 'Country'} — who's been here?
+        </div>
+        {members.length === 0 && (
+          <div style={{color:'#64748b', fontSize:13, marginBottom:12}}>Add family members first (Family tab).</div>
+        )}
+        {members.map(m => {
+          const checked = visitorIds.includes(m.id);
+          return (
+            <div key={m.id} onClick={() => onToggle(m, region)}
+              style={{display:'flex', alignItems:'center', gap:10, padding:'10px 4px',
+                cursor:'pointer', borderBottom:'1px solid #16233a'}}>
+              <div style={{width:20, height:20, borderRadius:5, border:`2px solid ${m.color}`,
+                background: checked ? m.color : 'none', flexShrink:0,
+                display:'flex', alignItems:'center', justifyContent:'center', fontSize:13, color:'#05080f'}}>
+                {checked ? '✓' : ''}
+              </div>
+              <span style={{color:'#f1f5f9', fontSize:15}}>{m.name}</span>
+            </div>
+          );
+        })}
+        <button onClick={onClose}
+          style={{width:'100%', padding:'12px', background:'none', border:'1px solid #1e293b',
+            borderRadius:8, color:'#94a3b8', cursor:'pointer', fontSize:14, marginTop:16}}>
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Family tab ──
+function FamilyTab({ members, onSave, onDelete, backendUrlInput, setBackendUrlInput, onSaveUrl, testStatus, onTestUrl }) {
+  const [editing, setEditing] = React.useState(null); // member id being edited, or 'new'
+  const [name, setName] = React.useState('');
+  const [color, setColor] = React.useState(MEMBER_COLORS[0]);
+
+  function startEdit(m) { setEditing(m.id); setName(m.name); setColor(m.color); }
+  function startNew() { setEditing('new'); setName(''); setColor(MEMBER_COLORS[members.length % MEMBER_COLORS.length]); }
+  function save() {
+    if (!name.trim()) return;
+    onSave({ id: editing === 'new' ? uid() : editing, name: name.trim(), color });
+    setEditing(null);
+  }
+
+  return (
+    <div style={{padding:16}}>
+      <div style={{fontSize:15, fontWeight:700, color:'#f1f5f9', marginBottom:12}}>Family Members</div>
+      {members.map(m => (
+        <div key={m.id} style={{background:'#0f172a', border:'1px solid #1e293b', borderRadius:10,
+          padding:'12px 14px', marginBottom:8, display:'flex', alignItems:'center', gap:10}}>
+          <span style={{width:14, height:14, borderRadius:'50%', background:m.color, flexShrink:0}}></span>
+          <span style={{flex:1, color:'#f1f5f9', fontSize:15}}>{m.name}</span>
+          <button onClick={() => startEdit(m)}
+            style={{background:'none', border:'1px solid #1e293b', borderRadius:6, color:'#94a3b8',
+              cursor:'pointer', padding:'6px 10px', fontSize:12}}>Edit</button>
+          <button onClick={() => { if (window.confirm(`Remove ${m.name} and all their visits?`)) onDelete(m.id); }}
+            style={{background:'none', border:'none', color:'#ef4444', cursor:'pointer', fontSize:16, padding:'4px 6px'}}>×</button>
+        </div>
+      ))}
+      <button onClick={startNew}
+        style={{padding:'10px 18px', background:'#1e3a5f', border:'1px solid #3b82f6',
+          borderRadius:8, color:'#93c5fd', cursor:'pointer', fontSize:14, marginTop:4}}>
+        + Add family member
+      </button>
+
+      {editing && (
+        <div onClick={e => { if (e.target === e.currentTarget) setEditing(null); }}
+          style={{position:'fixed', inset:0, background:'rgba(0,0,0,0.88)',
+            display:'flex', alignItems:'center', justifyContent:'center', zIndex:400, padding:16}}>
+          <div style={{background:'#0d1827', border:'1px solid #1e3a5f', borderRadius:16, padding:24, width:'100%', maxWidth:340}}>
+            <div style={{fontSize:16, fontWeight:700, color:'#f1f5f9', marginBottom:14}}>
+              {editing === 'new' ? 'Add member' : 'Edit member'}
+            </div>
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="Name" autoFocus
+              style={{width:'100%', padding:'10px 12px', background:'#0f172a', border:'1px solid #1e3a5f',
+                borderRadius:8, color:'#f1f5f9', fontSize:14, marginBottom:14}} />
+            <div style={{display:'flex', gap:8, flexWrap:'wrap', marginBottom:18}}>
+              {MEMBER_COLORS.map(c => (
+                <div key={c} onClick={() => setColor(c)}
+                  style={{width:28, height:28, borderRadius:'50%', background:c, cursor:'pointer',
+                    border: color===c ? '3px solid #f1f5f9' : '3px solid transparent'}}></div>
+              ))}
+            </div>
+            <div style={{display:'flex', gap:8}}>
+              <button onClick={save}
+                style={{flex:1, padding:'11px', background:'#1e3a5f', border:'1px solid #3b82f6',
+                  borderRadius:8, color:'#93c5fd', cursor:'pointer', fontSize:14}}>Save</button>
+              <button onClick={() => setEditing(null)}
+                style={{flex:1, padding:'11px', background:'none', border:'1px solid #1e293b',
+                  borderRadius:8, color:'#94a3b8', cursor:'pointer', fontSize:14}}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={{marginTop:28, paddingTop:20, borderTop:'1px solid #1e293b'}}>
+        <div style={{color:'#94a3b8', fontSize:13, marginBottom:8}}>
+          Apps Script URL — share this with other devices so everyone syncs to the same data
+        </div>
+        <input value={backendUrlInput} onChange={e => setBackendUrlInput(e.target.value)}
+          style={{width:'100%', padding:'10px 12px', background:'#0f172a',
+            border:'1px solid #1e293b', borderRadius:8, color:'#f1f5f9',
+            fontSize:12, marginBottom:8}} />
+        <div style={{display:'flex', gap:8, marginBottom:8}}>
+          <button onClick={onTestUrl}
+            style={{padding:'8px 16px', background:'none', border:'1px solid #1e293b',
+              borderRadius:8, color:'#94a3b8', cursor:'pointer', fontSize:13}}>Test</button>
+          <button onClick={onSaveUrl}
+            style={{padding:'8px 16px', background:'#1e3a5f', border:'1px solid #3b82f6',
+              borderRadius:8, color:'#93c5fd', cursor:'pointer', fontSize:13}}>Save</button>
+        </div>
+        {testStatus && <div style={{fontSize:13,
+          color: testStatus.startsWith('Connected') ? '#22c55e' : '#ef4444'}}>{testStatus}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ── Stats tab ──
+function StatsTab({ members, visits, usTotal, worldTotal }) {
+  const usCodesAny = new Set(visits.filter(v => v.type==='us').map(v => v.code));
+  const worldCodesAny = new Set(visits.filter(v => v.type==='world').map(v => v.code));
+  return (
+    <div style={{padding:16}}>
+      <div style={{background:'#0f172a', border:'1px solid #1e293b', borderRadius:10, padding:16, marginBottom:16}}>
+        <div style={{fontSize:15, fontWeight:700, color:'#f1f5f9', marginBottom:10}}>Family Total</div>
+        <div style={{color:'#94a3b8', fontSize:13, marginBottom:4}}>
+          States visited by anyone: <span style={{color:'#f1f5f9'}}>{usCodesAny.size} / {usTotal}</span>
+        </div>
+        <div style={{color:'#94a3b8', fontSize:13}}>
+          Countries visited by anyone: <span style={{color:'#f1f5f9'}}>{worldCodesAny.size} / {worldTotal}</span>
+        </div>
+      </div>
+      {members.map(m => {
+        const us = visits.filter(v => v.type==='us' && v.member_id===m.id).length;
+        const world = visits.filter(v => v.type==='world' && v.member_id===m.id).length;
+        return (
+          <div key={m.id} style={{background:'#0f172a', border:'1px solid #1e293b', borderRadius:10, padding:16, marginBottom:10}}>
+            <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:10}}>
+              <span style={{width:12, height:12, borderRadius:'50%', background:m.color}}></span>
+              <span style={{color:'#f1f5f9', fontSize:15, fontWeight:700}}>{m.name}</span>
+            </div>
+            <div style={{color:'#94a3b8', fontSize:13, marginBottom:6}}>
+              States: <span style={{color:'#f1f5f9'}}>{us} / {usTotal}</span>
+              <div style={{background:'#1e293b', borderRadius:4, height:6, marginTop:4}}>
+                <div style={{background:m.color, height:6, borderRadius:4, width:`${usTotal?(us/usTotal*100):0}%`}}></div>
+              </div>
+            </div>
+            <div style={{color:'#94a3b8', fontSize:13}}>
+              Countries: <span style={{color:'#f1f5f9'}}>{world} / {worldTotal}</span>
+              <div style={{background:'#1e293b', borderRadius:4, height:6, marginTop:4}}>
+                <div style={{background:m.color, height:6, borderRadius:4, width:`${worldTotal?(world/worldTotal*100):0}%`}}></div>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+      {members.length === 0 && <div style={{color:'#64748b', fontSize:13}}>Add family members to see stats.</div>}
+    </div>
+  );
+}
+
+// ── Main App ──
+function App() {
+  const [screen, setScreen] = React.useState('loading');
+  const [tab, setTab] = React.useState('us');
+  const [members, setMembers] = React.useState([]);
+  const [visits, setVisits] = React.useState([]);
+  const [filter, setFilter] = React.useState('all');
+  const [selectedRegion, setSelectedRegion] = React.useState(null);
+  const [syncDot, setSyncDot] = React.useState('');
+  const [backendUrlInput, setBackendUrlInput] = React.useState('');
+  const [testStatus, setTestStatus] = React.useState('');
+
+  const [usFeatures, setUsFeatures] = React.useState([]);
+  const [worldFeatures, setWorldFeatures] = React.useState([]);
+  const [mapsLoading, setMapsLoading] = React.useState(true);
+
+  const pullingRef = React.useRef(false);
+  const lastPullRef = React.useRef(0);
+  const syncDotTimerRef = React.useRef(null);
+
+  function flashSync(apiPromise) {
+    setSyncDot('up');
+    apiPromise.then(res => {
+      clearTimeout(syncDotTimerRef.current);
+      setSyncDot(res === null ? 'err' : 'ok');
+      syncDotTimerRef.current = setTimeout(() => setSyncDot(''), 3000);
+    }).catch(() => setSyncDot('err'));
+  }
+
+  // ── Load map geometry once ──
+  React.useEffect(() => {
+    Promise.all([
+      fetch(US_TOPO_URL).then(r => r.json()),
+      fetch(WORLD_TOPO_URL).then(r => r.json())
+    ]).then(([usTopo, worldTopo]) => {
+      const usGeo = topojson.feature(usTopo, usTopo.objects.states);
+      const usPath = d3.geoPath();
+      setUsFeatures(usGeo.features.map(f => ({
+        code: String(f.id), name: f.properties.name,
+        d: usPath(f), centroid: usPath.centroid(f)
+      })));
+
+      const worldGeo = topojson.feature(worldTopo, worldTopo.objects.countries);
+      const projection = d3.geoNaturalEarth1().fitSize([960, 500], worldGeo);
+      const worldPath = d3.geoPath().projection(projection);
+      setWorldFeatures(worldGeo.features
+        .filter(f => f.properties && f.properties.name && f.properties.name !== 'Antarctica')
+        .map(f => ({
+          code: String(f.id), name: f.properties.name,
+          d: worldPath(f), centroid: worldPath.centroid(f)
+        })));
+
+      setMapsLoading(false);
+    }).catch(() => setMapsLoading(false));
+  }, []);
+
+  // ── Boot ──
+  React.useEffect(() => {
+    const local = loadLocal();
+    if (!local.backendUrl && BACKEND === 'YOUR_APPS_SCRIPT_URL_HERE') {
+      setScreen('onboarding'); return;
+    }
+    if (local.members) setMembers(local.members);
+    if (local.visits) setVisits(local.visits);
+    setBackendUrlInput(getBackendUrl());
+    setScreen('app');
+  }, []);
+
+  React.useEffect(() => {
+    if (screen !== 'app') return;
+    saveLocal({ backendUrl: getBackendUrl(), members, visits });
+  }, [members, visits, screen]);
+
+  async function doPull(force) {
+    if (!getBackendUrl() || pullingRef.current) return;
+    const now = Date.now();
+    if (!force && now - lastPullRef.current < 60000) return;
+    pullingRef.current = true; lastPullRef.current = now;
+    try {
+      const res = await api({ action: 'get_all' });
+      if (res?.ok) {
+        if (res.members) setMembers(res.members);
+        if (res.visits) setVisits(res.visits);
+      }
+    } catch(e) {}
+    setTimeout(() => { pullingRef.current = false; }, 500);
+  }
+
+  React.useEffect(() => {
+    if (screen !== 'app') return;
+    doPull(true);
+    function onVisible() { if (document.visibilityState === 'visible') doPull(false); }
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [screen]);
+
+  function handleOnboardingComplete(backendUrl, cloudData) {
+    saveLocal({ backendUrl });
+    if (cloudData?.members?.length) {
+      setMembers(cloudData.members);
+      setVisits(cloudData.visits || []);
+    } else if (!cloudData) {
+      // starting fresh — seed with default family members
+      const seeded = defaultMembers();
+      setMembers(seeded);
+      seeded.forEach(m => flashSync(api({ action: 'save_member', ...m })));
+    }
+    setBackendUrlInput(backendUrl);
+    setScreen('app');
+  }
+
+  // ── Member actions ──
+  function saveMember(m) {
+    setMembers(prev => [...prev.filter(x => x.id !== m.id), m]);
+    flashSync(api({ action: 'save_member', ...m }));
+  }
+  function deleteMember(id) {
+    setMembers(prev => prev.filter(x => x.id !== id));
+    setVisits(prev => prev.filter(x => x.member_id !== id));
+    if (filter === id) setFilter('all');
+    flashSync(api({ action: 'delete_member', id }));
+  }
+
+  // ── Visit toggle ──
+  function toggleVisit(member, region) {
+    const existing = visits.find(v => v.type === region.type && v.code === region.code && v.member_id === member.id);
+    if (existing) {
+      setVisits(prev => prev.filter(x => x.id !== existing.id));
+      flashSync(api({ action: 'delete_visit', id: existing.id }));
+    } else {
+      const v = { id: uid(), member_id: member.id, type: region.type, code: region.code, name: region.name };
+      setVisits(prev => [...prev, v]);
+      flashSync(api({ action: 'save_visit', ...v }));
+    }
+  }
+
+  function saveBackendUrl() {
+    saveLocal({ ...loadLocal(), backendUrl: backendUrlInput });
+    doPull(true);
+  }
+  async function testBackendUrl() {
+    setTestStatus('Testing...');
+    const prev = loadLocal();
+    saveLocal({ ...prev, backendUrl: backendUrlInput });
+    const res = await api({ action: 'get_all' });
+    setTestStatus(res?.ok ? 'Connected' : 'Could not reach URL — check deployment settings');
+  }
+
+  if (screen === 'loading') return null;
+  if (screen === 'onboarding') return <OnboardingScreen onComplete={handleOnboardingComplete} />;
+
+  const syncColor = syncDot === 'ok' ? '#22c55e' : syncDot === 'err' ? '#ef4444' : '#93c5fd';
+  const syncLabel = syncDot === 'up' ? '↑' : syncDot === 'ok' ? '✓' : syncDot === 'err' ? '⚠' : '';
+
+  const TABS = [
+    {k:'us', l:'US Map'},
+    {k:'world', l:'World Map'},
+    {k:'family', l:'Family'},
+    {k:'stats', l:'Stats'},
+  ];
+
+  return (
+    <div style={{minHeight:'100vh', background:'#05080f', color:'#cbd5e1', fontFamily:'Georgia,serif', paddingBottom:60}}>
+      <div style={{background:'#0a0f1a', borderBottom:'1px solid #1e293b',
+        padding:'12px 16px', display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+        <div style={{fontWeight:700, color:'#f1f5f9', fontSize:17}}>Family Travel Tracker</div>
+        {syncLabel && <span style={{color:syncColor, fontSize:16, fontWeight:700}}>{syncLabel}</span>}
+      </div>
+
+      {(tab === 'us' || tab === 'world') && (
+        <React.Fragment>
+          <MemberChips members={members} filter={filter} setFilter={setFilter} />
+          <MapView
+            type={tab}
+            features={tab === 'us' ? usFeatures : worldFeatures}
+            loading={mapsLoading}
+            members={members}
+            visits={visits}
+            filter={filter}
+            onRegionClick={(f) => setSelectedRegion({ type: tab, code: f.code, name: f.name })}
+          />
+          <div style={{padding:'0 16px', display:'flex', gap:14, fontSize:12, color:'#64748b', flexWrap:'wrap'}}>
+            <span><span style={{display:'inline-block', width:10, height:10, background:UNVISITED_FILL, border:'1px solid #1e293b', marginRight:5, verticalAlign:'middle'}}></span>Not visited</span>
+            <span><span style={{display:'inline-block', width:10, height:10, background:PARTIAL_FILL, marginRight:5, verticalAlign:'middle'}}></span>Some visited</span>
+            <span><span style={{display:'inline-block', width:10, height:10, background:ALL_VISITED_FILL, border:`1px solid ${ALL_VISITED_STROKE}`, marginRight:5, verticalAlign:'middle'}}></span>Everyone's been</span>
+          </div>
+        </React.Fragment>
+      )}
+
+      {tab === 'family' && (
+        <FamilyTab members={members} onSave={saveMember} onDelete={deleteMember}
+          backendUrlInput={backendUrlInput} setBackendUrlInput={setBackendUrlInput}
+          onSaveUrl={saveBackendUrl} onTestUrl={testBackendUrl} testStatus={testStatus} />
+      )}
+
+      {tab === 'stats' && (
+        <StatsTab members={members} visits={visits} usTotal={usFeatures.length} worldTotal={worldFeatures.length} />
+      )}
+
+      <RegionModal region={selectedRegion} members={members} visits={visits}
+        onToggle={toggleVisit} onClose={() => setSelectedRegion(null)} />
+
+      <div style={{position:'fixed', bottom:0, left:0, right:0,
+        background:'#0a0f1a', borderTop:'1px solid #1e293b', display:'flex', zIndex:200}}>
+        {TABS.map(item => (
+          <button key={item.k} onClick={() => setTab(item.k)}
+            style={{flex:1, padding:'11px 4px 13px', background:'none', border:'none',
+              borderTop: tab===item.k ? '2px solid #3b82f6' : '2px solid transparent',
+              color: tab===item.k ? '#93c5fd' : '#475569',
+              fontSize:11, cursor:'pointer', fontWeight: tab===item.k ? 700 : 400}}>
+            {item.l}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
